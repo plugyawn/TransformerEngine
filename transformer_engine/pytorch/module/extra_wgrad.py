@@ -131,6 +131,14 @@ def _cast_feature_input(inputmat: Any, recipe: Any) -> torch.Tensor:
 
 
 def _accumulate_diag_feature_gram(gram: torch.Tensor, x: torch.Tensor) -> None:
+    if gram.is_cuda and x.is_cuda:
+        try:
+            from emerging_optimizers.triton_kernels.feature_gram import diag_feature_gram_reduce
+
+            diag_feature_gram_reduce(x, out=gram, accumulate=True)
+            return
+        except Exception:
+            pass
     gram.add_(torch.sum(x * x, dim=0))
 
 
