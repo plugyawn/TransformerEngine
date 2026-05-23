@@ -130,6 +130,30 @@ def _cast_feature_input(inputmat: Any, recipe: Any) -> torch.Tensor:
     return inputmat.to(accumulation_dtype)
 
 
+def _accumulate_diag_feature_gram(gram: torch.Tensor, x: torch.Tensor) -> None:
+    gram.add_(torch.sum(x * x, dim=0))
+
+
+def _accumulate_block_diag_feature_gram(gram: torch.Tensor, x: torch.Tensor, block_size: int) -> None:
+    if gram.ndim != 3 or gram.shape[-1] != gram.shape[-2]:
+        raise RuntimeError("block_diag FEATURE_GRAM buffer must have shape [num_blocks, b, b].")
+    num_blocks = gram.shape[0]
+    if gram.shape[-1] != block_size:
+        raise RuntimeError(
+            f"block_diag FEATURE_GRAM buffer block size {gram.shape[-1]} does not match "
+            f"recipe block size {block_size}."
+        )
+    padded_dim = num_blocks * block_size
+    if x.shape[-1] > padded_dim:
+        raise RuntimeError(
+            f"block_diag FEATURE_GRAM buffer covers {padded_dim} features, got {x.shape[-1]}."
+        )
+    if x.shape[-1] < padded_dim:
+        x = torch.nn.functional.pad(x, (0, padded_dim - x.shape[-1]))
+    x_blocks = x.reshape(x.shape[0], num_blocks, block_size).transpose(0, 1)
+    gram.add_(torch.bmm(x_blocks.transpose(1, 2), x_blocks))
+
+
 @torch.no_grad()
 def maybe_accumulate_feature_gram(weight: Any, inputmat: Any) -> None:
     """Accumulate ``X.T @ X`` for a TE linear weight when requested.
@@ -171,7 +195,11 @@ def maybe_accumulate_feature_gram(weight: Any, inputmat: Any) -> None:
     if approximation == "full":
         gram.add_(x.t().matmul(x))
     elif approximation == "diag":
-        gram.add_((x * x).sum(dim=0))
+        _accumulate_diag_feature_gram(gram, x)
+    elif approximation == "block_diag":
+        _accumulate_block_diag_feature_gram(
+            gram, x, int(_recipe_field(recipe, "block_size", 128))
+        )
     else:
         raise NotImplementedError(
             f"FEATURE_GRAM approximation {approximation!r} is not implemented in TE yet."
