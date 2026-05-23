@@ -57,6 +57,10 @@ from ..constants import FP8BwdTensorIdx, FP8FwdTensorIdx, GemmParallelModes, dis
 from ..jit import no_torch_dynamo
 from ..graph import is_graph_capturing
 from ._common import apply_normalization, noop_cat, WeightGradStore
+from .extra_wgrad import (
+    maybe_accumulate_feature_gram,
+    validate_extra_wgrad_factors_need_fused_main_grad,
+)
 from ..quantized_tensor import (
     QuantizedTensor,
     QuantizedTensorStorage,
@@ -498,6 +502,12 @@ class _LayerNormLinear(torch.autograd.Function):
             ctx.requires_wgrad = weight.requires_grad
             ctx.is_weight_param_quantized = is_weight_param_quantized
             ctx.is_fsdp2 = is_fsdp2
+            validate_extra_wgrad_factors_need_fused_main_grad(
+                weight,
+                "LayerNormLinear",
+                fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+                requires_wgrad=weight.requires_grad and is_grad_enabled,
+            )
             if fuse_wgrad_accumulation and weight.requires_grad:
                 # Keep weakref to weight to preserve attributes like main_grad
                 # when we need to modify the weight python object
@@ -913,6 +923,7 @@ class _LayerNormLinear(torch.autograd.Function):
                     else:
                         ctx.input_quantizer.set_usage(rowwise=False, columnwise=True)
                         ln_out_total = ctx.input_quantizer(ln_out_total)
+                maybe_accumulate_feature_gram(origin_weight, ln_out_total)
 
                 if ctx.fp8 or ctx.debug:
                     if isinstance(grad_output, QuantizedTensorStorage):

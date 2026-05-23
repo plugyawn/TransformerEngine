@@ -28,6 +28,10 @@ from .base import (
     _2X_ACC_WGRAD,
 )
 from ._common import noop_cat, WeightGradStore
+from .extra_wgrad import (
+    maybe_accumulate_feature_gram,
+    validate_extra_wgrad_factors_need_fused_main_grad,
+)
 from ..quantization import FP8GlobalStateManager, QuantizerRole
 from ..utils import (
     cast_if_needed,
@@ -675,6 +679,12 @@ def _linear_setup_ctx(
     bwd_args.is_first_microbatch = fwd_args.is_first_microbatch
     bwd_args.fuse_wgrad_accumulation = fuse_wgrad_accumulation
     bwd_args.wgrad_store = fwd_args.wgrad_store
+    validate_extra_wgrad_factors_need_fused_main_grad(
+        weight,
+        "Linear",
+        fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+        requires_wgrad=fwd_args.weight_requires_grad and fwd_args.is_grad_enabled,
+    )
     if fuse_wgrad_accumulation and fwd_args.weight_requires_grad:
         bwd_args.origin_weight_ref = weakref.ref(weight)
         bwd_args.origin_weight_overwrites_main_grad = getattr(weight, "overwrite_main_grad", False)
@@ -1051,6 +1061,7 @@ def _linear_backward(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None], ..
                 else:
                     input_quantizer.set_usage(rowwise=False, columnwise=True)
                     inputmat_total = input_quantizer(inputmat_total)
+            maybe_accumulate_feature_gram(origin_weight_python_object, inputmat_total)
 
             # Prepare grad output tensor
             # Note: Synchronize tensor-parallel communication and

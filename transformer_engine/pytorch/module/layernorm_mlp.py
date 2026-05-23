@@ -72,6 +72,10 @@ from ..tensor.mxfp8_tensor import MXFP8Quantizer
 from ..tensor.nvfp4_tensor import NVFP4Quantizer
 from ..tensor.float8_blockwise_tensor import Float8BlockQuantizer
 from ._common import apply_normalization, WeightGradStore
+from .extra_wgrad import (
+    maybe_accumulate_feature_gram,
+    validate_extra_wgrad_factors_need_fused_main_grad,
+)
 from ..cpu_offload import (
     is_cpu_offload_enabled,
     start_offload,
@@ -799,6 +803,18 @@ class _LayerNormMLP(torch.autograd.Function):
                 ctx.save_for_backward(*tensors_to_save)
                 ctx.tensor_objects = tensor_objects
 
+            validate_extra_wgrad_factors_need_fused_main_grad(
+                fc1_weight,
+                "LayerNormMLP.fc1",
+                fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+                requires_wgrad=fc1_weight.requires_grad and is_grad_enabled,
+            )
+            validate_extra_wgrad_factors_need_fused_main_grad(
+                fc2_weight,
+                "LayerNormMLP.fc2",
+                fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+                requires_wgrad=fc2_weight.requires_grad and is_grad_enabled,
+            )
             if fuse_wgrad_accumulation:
                 # Keep weakrefs to weights to preserve attributes like main_grad
                 # when we need to modify the weight python objects
@@ -1306,6 +1322,7 @@ class _LayerNormMLP(torch.autograd.Function):
                     else:
                         ctx.fc2_input_quantizer.set_usage(rowwise=False, columnwise=True)
                         act_out = ctx.fc2_input_quantizer(act_out)
+                maybe_accumulate_feature_gram(fc2_weight_python_object, act_out)
 
                 if ctx.fp8 or ctx.debug:
                     if isinstance(grad_output, QuantizedTensorStorage):
@@ -1564,6 +1581,7 @@ class _LayerNormMLP(torch.autograd.Function):
                     else:
                         ctx.fc1_input_quantizer.set_usage(rowwise=False, columnwise=True)
                         ln_out_total = ctx.fc1_input_quantizer(ln_out_total)
+                maybe_accumulate_feature_gram(fc1_weight_python_object, ln_out_total)
 
                 # Prepare grad output tensor
                 # Note: Synchronize tensor-parallel communication and
