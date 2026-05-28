@@ -204,6 +204,7 @@ list(APPEND transformer_engine_cuda_sources
      fused_router/fused_moe_aux_loss.cu
      fused_router/fused_score_for_moe_aux_loss.cu
      fused_router/fused_topk_with_score_function.cu
+     feature_gram/feature_gram.cu
      recipe/current_scaling.cu
      recipe/delayed_scaling.cu
      recipe/fp8_block_scaling.cu

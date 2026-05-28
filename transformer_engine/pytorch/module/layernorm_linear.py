@@ -57,6 +57,10 @@ from ..constants import FP8BwdTensorIdx, FP8FwdTensorIdx, GemmParallelModes, dis
 from ..jit import no_torch_dynamo
 from ..graph import is_graph_capturing
 from ._common import apply_normalization, noop_cat, WeightGradStore
+from .extra_wgrad import (
+    validate_extra_wgrad_factors,
+    wrap_wgrad_closure_with_feature_factors,
+)
 from ..quantized_tensor import (
     QuantizedTensor,
     QuantizedTensorStorage,
@@ -498,6 +502,12 @@ class _LayerNormLinear(torch.autograd.Function):
             ctx.requires_wgrad = weight.requires_grad
             ctx.is_weight_param_quantized = is_weight_param_quantized
             ctx.is_fsdp2 = is_fsdp2
+            validate_extra_wgrad_factors(
+                weight,
+                "LayerNormLinear",
+                fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+                requires_wgrad=weight.requires_grad and is_grad_enabled,
+            )
             if fuse_wgrad_accumulation and weight.requires_grad:
                 # Keep weakref to weight to preserve attributes like main_grad
                 # when we need to modify the weight python object
@@ -982,6 +992,12 @@ class _LayerNormLinear(torch.autograd.Function):
                     dw, db, *_ = general_gemm(x, dy, **wgrad_gemm_kwargs)
                     nvtx_range_pop(f"{nvtx_label}.wgrad_gemm")
                     return dw, db
+
+                # Wrap so caller-attached extra wgrad factors share microbatch
+                # ordering with the wgrad GEMM (inline or via WeightGradStore).
+                wgrad_gemm = wrap_wgrad_closure_with_feature_factors(
+                    origin_weight, wgrad_gemm
+                )
 
                 # Choose whether to call wgrad GEMM now or delay
                 if ctx.wgrad_store is not None and ctx.wgrad_store.delay_wgrad_compute():

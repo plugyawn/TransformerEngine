@@ -639,6 +639,14 @@ void cusolvermp_ctx_destroy(int64_t ctx_ptr);
 void newton_schulz(int64_t ctx_ptr, int64_t m, int64_t n, at::Tensor x, int64_t num_iterations,
                    std::vector<float> coefficients);
 
+/***************************************************************************************************
+ * Feature Gram accumulation
+ **************************************************************************************************/
+
+void feature_gram_diag(at::Tensor x, at::Tensor out);
+
+void feature_gram_block_diag(at::Tensor x, at::Tensor out, int64_t block_size);
+
 }  // namespace transformer_engine::pytorch
 
 /***************************************************************************************************

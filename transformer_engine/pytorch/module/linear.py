@@ -28,6 +28,10 @@ from .base import (
     _2X_ACC_WGRAD,
 )
 from ._common import noop_cat, WeightGradStore
+from .extra_wgrad import (
+    validate_extra_wgrad_factors,
+    wrap_wgrad_closure_with_feature_factors,
+)
 from ..quantization import FP8GlobalStateManager, QuantizerRole
 from ..utils import (
     cast_if_needed,
@@ -675,6 +679,12 @@ def _linear_setup_ctx(
     bwd_args.is_first_microbatch = fwd_args.is_first_microbatch
     bwd_args.fuse_wgrad_accumulation = fuse_wgrad_accumulation
     bwd_args.wgrad_store = fwd_args.wgrad_store
+    validate_extra_wgrad_factors(
+        weight,
+        "Linear",
+        fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+        requires_wgrad=fwd_args.weight_requires_grad and fwd_args.is_grad_enabled,
+    )
     if fuse_wgrad_accumulation and fwd_args.weight_requires_grad:
         bwd_args.origin_weight_ref = weakref.ref(weight)
         bwd_args.origin_weight_overwrites_main_grad = getattr(weight, "overwrite_main_grad", False)
@@ -1159,6 +1169,14 @@ def _linear_backward(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None], ..
                 dw, db, *_ = general_gemm(x, dy, **wgrad_gemm_kwargs)
                 nvtx_range_pop(f"{nvtx_label}.wgrad_gemm")
                 return dw, db
+
+            # Wrap the wgrad closure so any caller-attached extra wgrad factor
+            # (e.g. FEATURE_GRAM) accumulates with the same microbatch ordering
+            # as the wgrad GEMM itself, whether called inline or queued onto
+            # WeightGradStore for delayed execution.
+            wgrad_gemm = wrap_wgrad_closure_with_feature_factors(
+                origin_weight_python_object, wgrad_gemm
+            )
 
             # Choose whether to call wgrad GEMM now or delay
             if bwd_args.wgrad_store is not None and bwd_args.wgrad_store.delay_wgrad_compute():

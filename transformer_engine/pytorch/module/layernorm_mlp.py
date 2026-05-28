@@ -72,6 +72,10 @@ from ..tensor.mxfp8_tensor import MXFP8Quantizer
 from ..tensor.nvfp4_tensor import NVFP4Quantizer
 from ..tensor.float8_blockwise_tensor import Float8BlockQuantizer
 from ._common import apply_normalization, WeightGradStore
+from .extra_wgrad import (
+    validate_extra_wgrad_factors,
+    wrap_wgrad_closure_with_feature_factors,
+)
 from ..cpu_offload import (
     is_cpu_offload_enabled,
     start_offload,
@@ -799,6 +803,18 @@ class _LayerNormMLP(torch.autograd.Function):
                 ctx.save_for_backward(*tensors_to_save)
                 ctx.tensor_objects = tensor_objects
 
+            validate_extra_wgrad_factors(
+                fc1_weight,
+                "LayerNormMLP.fc1",
+                fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+                requires_wgrad=fc1_weight.requires_grad and is_grad_enabled,
+            )
+            validate_extra_wgrad_factors(
+                fc2_weight,
+                "LayerNormMLP.fc2",
+                fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+                requires_wgrad=fc2_weight.requires_grad and is_grad_enabled,
+            )
             if fuse_wgrad_accumulation:
                 # Keep weakrefs to weights to preserve attributes like main_grad
                 # when we need to modify the weight python objects
@@ -1352,6 +1368,12 @@ class _LayerNormMLP(torch.autograd.Function):
                     dw, db, *_ = general_gemm(x, dy, **fc2_wgrad_gemm_kwargs)
                     return dw, db
 
+                # Wrap so extra wgrad factors share microbatch ordering with
+                # the wgrad GEMM (inline or via WeightGradStore).
+                fc2_wgrad_gemm = wrap_wgrad_closure_with_feature_factors(
+                    fc2_weight_python_object, fc2_wgrad_gemm
+                )
+
                 # Choose whether to call wgrad GEMM now or delay
                 if ctx.wgrad_store is not None and ctx.wgrad_store.delay_wgrad_compute():
                     ctx.wgrad_store.put([act_out, grad_output], fc2_wgrad_gemm)
@@ -1620,6 +1642,12 @@ class _LayerNormMLP(torch.autograd.Function):
                     """
                     dw, db, *_ = general_gemm(x, dy, **fc1_wgrad_gemm_kwargs)
                     return dw, db
+
+                # Wrap so extra wgrad factors share microbatch ordering with
+                # the wgrad GEMM (inline or via WeightGradStore).
+                fc1_wgrad_gemm = wrap_wgrad_closure_with_feature_factors(
+                    fc1_weight_python_object, fc1_wgrad_gemm
+                )
 
                 # Choose whether to call wgrad GEMM now or delay
                 if ctx.wgrad_store is not None and ctx.wgrad_store.delay_wgrad_compute():

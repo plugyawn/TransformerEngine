@@ -24,6 +24,7 @@ from .base import (
     _2X_ACC_WGRAD,
 )
 from ._common import WeightGradStore
+from .extra_wgrad import assert_no_extra_wgrad_factors_requested
 from ..quantization import FP8GlobalStateManager, QuantizerRole
 from ..utils import (
     divide,
@@ -113,6 +114,9 @@ class _GroupedLinear(torch.autograd.Function):
         biases = weights_and_biases[num_gemms:]
         device = inp.device
         weight_requires_grad = weights[0].requires_grad
+        if is_grad_enabled and weight_requires_grad:
+            for weight in weights:
+                assert_no_extra_wgrad_factors_requested(weight, "GroupedLinear")
 
         # Configure quantizers
         if save_original_input and isinstance(input_quantizers[0], Float8Quantizer):
@@ -1142,6 +1146,15 @@ class GroupedLinear(TransformerEngineBaseModule):
             )
 
         is_grad_enabled = torch.is_grad_enabled()
+        if is_grad_enabled:
+            grouped_weight = getattr(self, "weight", None)
+            if grouped_weight is not None and grouped_weight.requires_grad:
+                assert_no_extra_wgrad_factors_requested(grouped_weight, "GroupedLinear")
+            elif grouped_weight is None:
+                for i in range(self.num_gemms):
+                    weight = getattr(self, f"weight{i}")
+                    if weight.requires_grad:
+                        assert_no_extra_wgrad_factors_requested(weight, "GroupedLinear")
 
         inp = self.prepare_forward(inp, num_gemms=self.num_gemms)
         try:

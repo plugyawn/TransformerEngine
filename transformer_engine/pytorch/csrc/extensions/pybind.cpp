@@ -603,6 +603,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("x"), py::arg("num_iterations"), py::arg("coefficients"),
         py::call_guard<py::gil_scoped_release>());
 
+  // Feature Gram accumulation
+  m.def("feature_gram_diag", &transformer_engine::pytorch::feature_gram_diag,
+        "Accumulate diag(X^T X) into out", py::arg("x"), py::arg("out"),
+        py::call_guard<py::gil_scoped_release>());
+  m.def("feature_gram_block_diag", &transformer_engine::pytorch::feature_gram_block_diag,
+        "Accumulate per-block X_b^T X_b into out", py::arg("x"), py::arg("out"),
+        py::arg("block_size"), py::call_guard<py::gil_scoped_release>());
+
   // Comm+GEMM Overlap
   m.def("bulk_overlap_ag_with_external_gemm",
         &transformer_engine::pytorch::bulk_overlap_ag_with_external_gemm,
