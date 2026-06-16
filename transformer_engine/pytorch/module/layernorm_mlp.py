@@ -73,8 +73,9 @@ from ..tensor.nvfp4_tensor import NVFP4Quantizer
 from ..tensor.float8_blockwise_tensor import Float8BlockQuantizer
 from ._common import apply_normalization, WeightGradStore
 from .extra_wgrad import (
+    get_extra_wgrad_request,
     validate_extra_wgrad_factors,
-    wrap_wgrad_closure_with_feature_factors,
+    wrap_wgrad_closure_with_wgrad_factors,
 )
 from ..cpu_offload import (
     is_cpu_offload_enabled,
@@ -815,14 +816,22 @@ class _LayerNormMLP(torch.autograd.Function):
                 fuse_wgrad_accumulation=fuse_wgrad_accumulation,
                 requires_wgrad=fc2_weight.requires_grad and is_grad_enabled,
             )
-            if fuse_wgrad_accumulation:
+            fc1_extra_wgrad_requested = get_extra_wgrad_request(fc1_weight) is not None
+            fc2_extra_wgrad_requested = get_extra_wgrad_request(fc2_weight) is not None
+            if fuse_wgrad_accumulation or fc1_extra_wgrad_requested or fc2_extra_wgrad_requested:
                 # Keep weakrefs to weights to preserve attributes like main_grad
                 # when we need to modify the weight python objects
                 ctx.fc1_weight_python_object_ref = (
-                    weakref.ref(fc1_weight) if fc1_weight.requires_grad else None
+                    weakref.ref(fc1_weight)
+                    if fc1_weight.requires_grad
+                    and (fuse_wgrad_accumulation or fc1_extra_wgrad_requested)
+                    else None
                 )
                 ctx.fc2_weight_python_object_ref = (
-                    weakref.ref(fc2_weight) if fc2_weight.requires_grad else None
+                    weakref.ref(fc2_weight)
+                    if fc2_weight.requires_grad
+                    and (fuse_wgrad_accumulation or fc2_extra_wgrad_requested)
+                    else None
                 )
                 ctx.fc1_weight_overwrites_main_grad = getattr(
                     fc1_weight, "overwrite_main_grad", False
@@ -830,20 +839,27 @@ class _LayerNormMLP(torch.autograd.Function):
                 ctx.fc2_weight_overwrites_main_grad = getattr(
                     fc2_weight, "overwrite_main_grad", False
                 )
-                # This check is needed to ensure that main_grad is not created
-                # during the forward pass when using MCore FSDP as it creates
-                # the main_grad buffer lazily before backprop
-                if hasattr(fc1_weight, "__fsdp_param__") and hasattr(fc2_weight, "__fsdp_param__"):
-                    # MCore FSDP creates main_grad lazily before backward
-                    ctx.fc1_main_grad_func = (
-                        fc1_weight.get_main_grad if fc1_weight.requires_grad else lambda: None
-                    )
-                    ctx.fc2_main_grad_func = (
-                        fc2_weight.get_main_grad if fc2_weight.requires_grad else lambda: None
-                    )
-                else:
-                    ctx.fc1_main_grad_func = lambda: fc1_weight.main_grad
-                    ctx.fc2_main_grad_func = lambda: fc2_weight.main_grad
+                if fuse_wgrad_accumulation:
+                    # This check is needed to ensure that main_grad is not created
+                    # during the forward pass when using MCore FSDP as it creates
+                    # the main_grad buffer lazily before backprop
+                    if hasattr(fc1_weight, "__fsdp_param__") and hasattr(
+                        fc2_weight, "__fsdp_param__"
+                    ):
+                        # MCore FSDP creates main_grad lazily before backward
+                        ctx.fc1_main_grad_func = (
+                            fc1_weight.get_main_grad
+                            if fc1_weight.requires_grad
+                            else lambda: None
+                        )
+                        ctx.fc2_main_grad_func = (
+                            fc2_weight.get_main_grad
+                            if fc2_weight.requires_grad
+                            else lambda: None
+                        )
+                    else:
+                        ctx.fc1_main_grad_func = lambda: fc1_weight.main_grad
+                        ctx.fc2_main_grad_func = lambda: fc2_weight.main_grad
 
             ctx.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe() if fp8 else None
             ctx.backward_override = backward_override
@@ -1067,13 +1083,16 @@ class _LayerNormMLP(torch.autograd.Function):
                 rsigma,
             ) = _LayerNormMLP._recompute(ctx)
 
-            # Restore origin weights from weakrefs
-            # Only needed when fuse_wgrad_accumulation is enabled.
+            # Restore origin weights from weakrefs. This is needed both for
+            # fused main_grad accumulation and for extra wgrad factor requests.
             fc1_weight_python_object = None
             fc2_weight_python_object = None
             fc1_weight_main_grad = None
             fc2_weight_main_grad = None
-            if ctx.fuse_wgrad_accumulation:
+            if (
+                getattr(ctx, "fc1_weight_python_object_ref", None) is not None
+                or getattr(ctx, "fc2_weight_python_object_ref", None) is not None
+            ):
                 fc1_weight_python_object_ref = getattr(ctx, "fc1_weight_python_object_ref", None)
                 fc2_weight_python_object_ref = getattr(ctx, "fc2_weight_python_object_ref", None)
                 ctx.fc1_weight_python_object_ref = None
@@ -1088,18 +1107,20 @@ class _LayerNormMLP(torch.autograd.Function):
                     if fc2_weight_python_object_ref is not None
                     else None
                 )
-                if ctx.fc1_weight_requires_grad:
+                if ctx.fc1_weight_requires_grad and fc1_weight_python_object_ref is not None:
                     assert (
                         fc1_weight_python_object is not None
-                    ), "fc1_weight was removed while fuse_wgrad_accumulation=True"
-                    fc1_weight_main_grad = ctx.fc1_main_grad_func()
-                    fc1_weight_python_object.main_grad = fc1_weight_main_grad
-                if ctx.fc2_weight_requires_grad:
+                    ), "fc1_weight was removed while extra wgrad factors were requested"
+                    if ctx.fuse_wgrad_accumulation:
+                        fc1_weight_main_grad = ctx.fc1_main_grad_func()
+                        fc1_weight_python_object.main_grad = fc1_weight_main_grad
+                if ctx.fc2_weight_requires_grad and fc2_weight_python_object_ref is not None:
                     assert (
                         fc2_weight_python_object is not None
-                    ), "fc2_weight was removed while fuse_wgrad_accumulation=True"
-                    fc2_weight_main_grad = ctx.fc2_main_grad_func()
-                    fc2_weight_python_object.main_grad = fc2_weight_main_grad
+                    ), "fc2_weight was removed while extra wgrad factors were requested"
+                    if ctx.fuse_wgrad_accumulation:
+                        fc2_weight_main_grad = ctx.fc2_main_grad_func()
+                        fc2_weight_python_object.main_grad = fc2_weight_main_grad
 
             # TODO: Fix this  # pylint: disable=fixme
             # Gather saved autograd context tensors when running with FSDP
@@ -1370,7 +1391,7 @@ class _LayerNormMLP(torch.autograd.Function):
 
                 # Wrap so extra wgrad factors share microbatch ordering with
                 # the wgrad GEMM (inline or via WeightGradStore).
-                fc2_wgrad_gemm = wrap_wgrad_closure_with_feature_factors(
+                fc2_wgrad_gemm = wrap_wgrad_closure_with_wgrad_factors(
                     fc2_weight_python_object, fc2_wgrad_gemm
                 )
 
@@ -1645,7 +1666,7 @@ class _LayerNormMLP(torch.autograd.Function):
 
                 # Wrap so extra wgrad factors share microbatch ordering with
                 # the wgrad GEMM (inline or via WeightGradStore).
-                fc1_wgrad_gemm = wrap_wgrad_closure_with_feature_factors(
+                fc1_wgrad_gemm = wrap_wgrad_closure_with_wgrad_factors(
                     fc1_weight_python_object, fc1_wgrad_gemm
                 )
 

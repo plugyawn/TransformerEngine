@@ -29,8 +29,9 @@ from .base import (
 )
 from ._common import noop_cat, WeightGradStore
 from .extra_wgrad import (
+    get_extra_wgrad_request,
     validate_extra_wgrad_factors,
-    wrap_wgrad_closure_with_feature_factors,
+    wrap_wgrad_closure_with_wgrad_factors,
 )
 from ..quantization import FP8GlobalStateManager, QuantizerRole
 from ..utils import (
@@ -685,13 +686,15 @@ def _linear_setup_ctx(
         fuse_wgrad_accumulation=fuse_wgrad_accumulation,
         requires_wgrad=fwd_args.weight_requires_grad and fwd_args.is_grad_enabled,
     )
-    if fuse_wgrad_accumulation and fwd_args.weight_requires_grad:
+    extra_wgrad_requested = get_extra_wgrad_request(weight) is not None
+    if (fuse_wgrad_accumulation or extra_wgrad_requested) and fwd_args.weight_requires_grad:
         bwd_args.origin_weight_ref = weakref.ref(weight)
         bwd_args.origin_weight_overwrites_main_grad = getattr(weight, "overwrite_main_grad", False)
-        if hasattr(weight, "__fsdp_param__"):
-            bwd_args.main_grad_func = weight.get_main_grad
-        else:
-            bwd_args.main_grad_func = lambda: weight.main_grad
+        if fuse_wgrad_accumulation:
+            if hasattr(weight, "__fsdp_param__"):
+                bwd_args.main_grad_func = weight.get_main_grad
+            else:
+                bwd_args.main_grad_func = lambda: weight.main_grad
 
     # Misc
     bwd_args.cpu_offloading = fwd_args.cpu_offloading
@@ -751,7 +754,7 @@ def _linear_backward(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None], ..
         origin_weight_python_object = None
         origin_weight_overwrites_main_grad = bwd_args.origin_weight_overwrites_main_grad
         main_grad = None
-        if bwd_args.fuse_wgrad_accumulation and bwd_args.requires_wgrad:
+        if bwd_args.origin_weight_ref is not None and bwd_args.requires_wgrad:
             origin_weight_ref = bwd_args.origin_weight_ref
             bwd_args.origin_weight_ref = None
             origin_weight_python_object = (
@@ -759,9 +762,10 @@ def _linear_backward(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None], ..
             )
             assert (
                 origin_weight_python_object is not None
-            ), "weight was removed while fuse_wgrad_accumulation=True"
-            main_grad = bwd_args.main_grad_func()
-            origin_weight_python_object.main_grad = main_grad
+            ), "weight was removed while extra wgrad factors were requested"
+            if bwd_args.fuse_wgrad_accumulation:
+                main_grad = bwd_args.main_grad_func()
+                origin_weight_python_object.main_grad = main_grad
 
         # Gather intermediate/activation tensors if needed
         # NOTE: weight_fp8 = weight when bwd_args.fp8 == False and torch.disttributed.FSDP already
@@ -1171,10 +1175,10 @@ def _linear_backward(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None], ..
                 return dw, db
 
             # Wrap the wgrad closure so any caller-attached extra wgrad factor
-            # (e.g. FEATURE_GRAM) accumulates with the same microbatch ordering
+            # (e.g. FEATURE_GRAM / GRAD_GRAM) accumulates with the same microbatch ordering
             # as the wgrad GEMM itself, whether called inline or queued onto
             # WeightGradStore for delayed execution.
-            wgrad_gemm = wrap_wgrad_closure_with_feature_factors(
+            wgrad_gemm = wrap_wgrad_closure_with_wgrad_factors(
                 origin_weight_python_object, wgrad_gemm
             )
 

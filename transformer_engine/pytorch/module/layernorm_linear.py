@@ -58,8 +58,9 @@ from ..jit import no_torch_dynamo
 from ..graph import is_graph_capturing
 from ._common import apply_normalization, noop_cat, WeightGradStore
 from .extra_wgrad import (
+    get_extra_wgrad_request,
     validate_extra_wgrad_factors,
-    wrap_wgrad_closure_with_feature_factors,
+    wrap_wgrad_closure_with_wgrad_factors,
 )
 from ..quantized_tensor import (
     QuantizedTensor,
@@ -508,7 +509,8 @@ class _LayerNormLinear(torch.autograd.Function):
                 fuse_wgrad_accumulation=fuse_wgrad_accumulation,
                 requires_wgrad=weight.requires_grad and is_grad_enabled,
             )
-            if fuse_wgrad_accumulation and weight.requires_grad:
+            extra_wgrad_requested = get_extra_wgrad_request(weight) is not None
+            if (fuse_wgrad_accumulation or extra_wgrad_requested) and weight.requires_grad:
                 # Keep weakref to weight to preserve attributes like main_grad
                 # when we need to modify the weight python object
                 ctx.origin_weight_ref = weakref.ref(weight)
@@ -516,14 +518,15 @@ class _LayerNormLinear(torch.autograd.Function):
                 ctx.origin_weight_overwrites_main_grad = getattr(
                     weight, "overwrite_main_grad", False
                 )
-                # This check is needed to ensure that main_grad is not created
-                # during the forward pass when using MCore FSDP as it creates
-                # the main_grad buffer lazily before backprop
-                if hasattr(weight, "__fsdp_param__"):
-                    # MCore FSDP creates main_grad lazily before backward
-                    ctx.main_grad_func = weight.get_main_grad
-                else:
-                    ctx.main_grad_func = lambda: weight.main_grad
+                if fuse_wgrad_accumulation:
+                    # This check is needed to ensure that main_grad is not created
+                    # during the forward pass when using MCore FSDP as it creates
+                    # the main_grad buffer lazily before backprop
+                    if hasattr(weight, "__fsdp_param__"):
+                        # MCore FSDP creates main_grad lazily before backward
+                        ctx.main_grad_func = weight.get_main_grad
+                    else:
+                        ctx.main_grad_func = lambda: weight.main_grad
             ctx.grad_input_quantizer = grad_input_quantizer
             ctx.grad_weight_quantizer = grad_weight_quantizer
             ctx.grad_output_quantizer = grad_output_quantizer
@@ -617,23 +620,25 @@ class _LayerNormLinear(torch.autograd.Function):
 
             # Restore from weakref to get original weight python object
             # (preserves attributes like main_grad, grad_added_to_main_grad, etc.)
-            # Only needed when fuse_wgrad_accumulation is enabled.
+            # Needed for fused main_grad accumulation and for extra wgrad
+            # factor requests that must see the original weight object.
             origin_weight = None
             origin_weight_overwrites_main_grad = getattr(
                 ctx, "origin_weight_overwrites_main_grad", False
             )
             main_grad = None
-            if ctx.fuse_wgrad_accumulation and ctx.requires_wgrad:
+            if getattr(ctx, "origin_weight_ref", None) is not None and ctx.requires_wgrad:
                 origin_weight_ref = ctx.origin_weight_ref
                 ctx.origin_weight_ref = None
                 origin_weight = origin_weight_ref() if origin_weight_ref is not None else None
                 assert (
                     origin_weight is not None
-                ), "weight was removed while fuse_wgrad_accumulation=True"
-                # Since main_grad can be modified inplace, it should not be a part of saved_tensors
-                main_grad = ctx.main_grad_func() if weight is not None else None
-                if main_grad is not None:
-                    origin_weight.main_grad = main_grad
+                ), "weight was removed while extra wgrad factors were requested"
+                if ctx.fuse_wgrad_accumulation:
+                    # Since main_grad can be modified inplace, it should not be a part of saved_tensors
+                    main_grad = ctx.main_grad_func() if weight is not None else None
+                    if main_grad is not None:
+                        origin_weight.main_grad = main_grad
 
             # Gather intermediate/activation tensors if needed
             # NOTE: weight_fp8 = weight when ctx.fp8 == False and torch.disttributed.FSDP already
@@ -995,7 +1000,7 @@ class _LayerNormLinear(torch.autograd.Function):
 
                 # Wrap so caller-attached extra wgrad factors share microbatch
                 # ordering with the wgrad GEMM (inline or via WeightGradStore).
-                wgrad_gemm = wrap_wgrad_closure_with_feature_factors(
+                wgrad_gemm = wrap_wgrad_closure_with_wgrad_factors(
                     origin_weight, wgrad_gemm
                 )
 

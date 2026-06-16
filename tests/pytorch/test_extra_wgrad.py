@@ -23,10 +23,12 @@ import transformer_engine_torch as tex
 from transformer_engine.pytorch.module.extra_wgrad import (
     FACTOR_FEATURE_GRAM,
     FACTOR_FEATURE_SUM,
+    FACTOR_GRAD_GRAM,
     ExtraWgradRequest,
     FeatureGramRecipe,
+    GradGramRecipe,
     get_extra_wgrad_request,
-    maybe_accumulate_feature_factors,
+    maybe_accumulate_wgrad_factors,
 )
 
 
@@ -180,28 +182,73 @@ def test_get_extra_wgrad_request_returns_none_when_unset():
 
 
 # ---------------------------------------------------------------------------
-# Helper accumulation: maybe_accumulate_feature_factors.
+# Helper accumulation: maybe_accumulate_wgrad_factors.
 # ---------------------------------------------------------------------------
 
 
-def _attach_request(weight, *, approximation, block_size=0, with_sum=False, dim=None):
-    dim = dim if dim is not None else weight.shape[0] if hasattr(weight, "shape") else 64
+def _alloc_gram(*, approximation, block_size=0, dim):
     if approximation == "diag":
-        gram = torch.zeros(dim, dtype=torch.float32, device="cuda")
-    elif approximation == "block_diag":
+        return torch.zeros(dim, dtype=torch.float32, device="cuda")
+    if approximation == "block_diag":
         num_blocks = (dim + block_size - 1) // block_size
-        gram = torch.zeros(num_blocks, block_size, block_size, dtype=torch.float32, device="cuda")
-    elif approximation == "full":
-        gram = torch.zeros(dim, dim, dtype=torch.float32, device="cuda")
-    else:
-        raise ValueError(approximation)
+        return torch.zeros(num_blocks, block_size, block_size, dtype=torch.float32, device="cuda")
+    if approximation == "full":
+        return torch.zeros(dim, dim, dtype=torch.float32, device="cuda")
+    raise ValueError(approximation)
+
+
+def _attach_request(
+    weight,
+    *,
+    approximation,
+    block_size=0,
+    with_sum=False,
+    with_grad=False,
+    dim=None,
+    grad_dim=None,
+):
+    dim = dim if dim is not None else weight.shape[0] if hasattr(weight, "shape") else 64
+    grad_dim = grad_dim if grad_dim is not None else weight.shape[0] if hasattr(weight, "shape") else dim
+    gram = _alloc_gram(approximation=approximation, block_size=block_size, dim=dim)
+    grad_gram = (
+        _alloc_gram(approximation=approximation, block_size=block_size, dim=grad_dim)
+        if with_grad
+        else None
+    )
     factors = FACTOR_FEATURE_GRAM | (FACTOR_FEATURE_SUM if with_sum else 0)
+    if with_grad:
+        factors |= FACTOR_GRAD_GRAM
     request = ExtraWgradRequest(
         factors=factors,
         feature_gram=FeatureGramRecipe(approximation=approximation, block_size=block_size),
         gram_buffer=gram,
         count_buffer=torch.zeros((), dtype=torch.float32, device="cuda"),
+        grad_gram=(
+            GradGramRecipe(approximation=approximation, block_size=block_size)
+            if with_grad
+            else None
+        ),
+        grad_gram_buffer=grad_gram,
+        grad_count_buffer=(
+            torch.zeros((), dtype=torch.float32, device="cuda") if with_grad else None
+        ),
         sum_buffer=(torch.zeros(dim, dtype=torch.float32, device="cuda") if with_sum else None),
+    )
+    weight._te_extra_wgrad = request
+    return request
+
+
+def _attach_grad_request(weight, *, approximation, block_size=0, grad_dim=None):
+    grad_dim = grad_dim if grad_dim is not None else weight.shape[0] if hasattr(weight, "shape") else 64
+    grad_gram = _alloc_gram(approximation=approximation, block_size=block_size, dim=grad_dim)
+    request = ExtraWgradRequest(
+        factors=FACTOR_GRAD_GRAM,
+        feature_gram=None,
+        gram_buffer=None,
+        count_buffer=None,
+        grad_gram=GradGramRecipe(approximation=approximation, block_size=block_size),
+        grad_gram_buffer=grad_gram,
+        grad_count_buffer=torch.zeros((), dtype=torch.float32, device="cuda"),
     )
     weight._te_extra_wgrad = request
     return request
@@ -212,11 +259,13 @@ def test_helper_diag_matches_reference():
     weight = torch.nn.Parameter(torch.empty(64, 32, device="cuda"))
     request = _attach_request(weight, approximation="diag", dim=128)
     x = torch.randn(256, 128, dtype=torch.bfloat16, device="cuda")
-    maybe_accumulate_feature_factors(weight, x)
+    dy = torch.randn(256, 64, dtype=torch.bfloat16, device="cuda")
+    maybe_accumulate_wgrad_factors(weight, x, dy)
 
     ref = (x.float() ** 2).sum(dim=0)
     torch.testing.assert_close(request.gram_buffer, ref, rtol=5e-2, atol=5e-2)
     assert float(request.count_buffer.item()) == 256.0
+    assert request.feature_rows == 256
 
 
 @requires_cuda
@@ -224,10 +273,12 @@ def test_helper_full_matches_reference():
     weight = torch.nn.Parameter(torch.empty(64, 32, device="cuda"))
     request = _attach_request(weight, approximation="full", dim=48)
     x = torch.randn(200, 48, dtype=torch.float32, device="cuda")
-    maybe_accumulate_feature_factors(weight, x)
+    dy = torch.randn(200, 64, dtype=torch.float32, device="cuda")
+    maybe_accumulate_wgrad_factors(weight, x, dy)
 
     ref = x.t() @ x
     torch.testing.assert_close(request.gram_buffer, ref, rtol=1e-4, atol=1e-4)
+    assert request.feature_rows == 200
 
 
 @requires_cuda
@@ -236,11 +287,13 @@ def test_helper_block_diag_matches_reference():
     B = 16
     request = _attach_request(weight, approximation="block_diag", block_size=B, dim=B * 3)
     x = torch.randn(128, B * 3, dtype=torch.float32, device="cuda")
-    maybe_accumulate_feature_factors(weight, x)
+    dy = torch.randn(128, 64, dtype=torch.float32, device="cuda")
+    maybe_accumulate_wgrad_factors(weight, x, dy)
 
     xb = x.reshape(128, 3, B).transpose(0, 1)
     ref = torch.bmm(xb.transpose(1, 2), xb)
     torch.testing.assert_close(request.gram_buffer, ref, rtol=1e-4, atol=1e-4)
+    assert request.feature_rows == 128
 
 
 @requires_cuda
@@ -248,7 +301,8 @@ def test_helper_feature_sum_accumulates():
     weight = torch.nn.Parameter(torch.empty(64, 32, device="cuda"))
     request = _attach_request(weight, approximation="diag", with_sum=True, dim=64)
     x = torch.randn(128, 64, dtype=torch.bfloat16, device="cuda")
-    maybe_accumulate_feature_factors(weight, x)
+    dy = torch.randn(128, 64, dtype=torch.bfloat16, device="cuda")
+    maybe_accumulate_wgrad_factors(weight, x, dy)
 
     torch.testing.assert_close(
         request.sum_buffer, x.float().sum(dim=0), rtol=5e-2, atol=5e-2
@@ -259,7 +313,9 @@ def test_helper_feature_sum_accumulates():
 def test_helper_no_request_is_noop():
     weight = torch.nn.Parameter(torch.empty(64, 32, device="cuda"))
     # No exception, no side effect.
-    maybe_accumulate_feature_factors(weight, torch.randn(8, 32, device="cuda"))
+    maybe_accumulate_wgrad_factors(
+        weight, torch.randn(8, 32, device="cuda"), torch.randn(8, 64, device="cuda")
+    )
 
 
 @requires_cuda
@@ -267,8 +323,38 @@ def test_helper_inactive_is_noop():
     weight = torch.nn.Parameter(torch.empty(64, 32, device="cuda"))
     request = _attach_request(weight, approximation="diag", dim=32)
     request.active = False
-    maybe_accumulate_feature_factors(weight, torch.randn(8, 32, device="cuda"))
+    maybe_accumulate_wgrad_factors(
+        weight, torch.randn(8, 32, device="cuda"), torch.randn(8, 64, device="cuda")
+    )
     assert torch.all(request.gram_buffer == 0).item()
+    assert request.feature_rows == 0
+
+
+@requires_cuda
+@pytest.mark.parametrize("approximation", ["diag", "full", "block_diag"])
+def test_helper_grad_gram_matches_reference(approximation):
+    weight = torch.nn.Parameter(torch.empty(64, 32, device="cuda"))
+    block_size = 16 if approximation == "block_diag" else 0
+    grad_dim = 48
+    request = _attach_grad_request(
+        weight, approximation=approximation, block_size=block_size, grad_dim=grad_dim
+    )
+    x = torch.randn(128, 32, dtype=torch.float32, device="cuda")
+    dy = torch.randn(128, grad_dim, dtype=torch.float32, device="cuda")
+    maybe_accumulate_wgrad_factors(weight, x, dy)
+
+    if approximation == "diag":
+        ref = (dy * dy).sum(dim=0)
+    elif approximation == "full":
+        ref = dy.t() @ dy
+    else:
+        padded_dim = ((grad_dim + block_size - 1) // block_size) * block_size
+        padded = torch.nn.functional.pad(dy, (0, padded_dim - grad_dim))
+        dy_blocks = padded.reshape(128, -1, block_size).transpose(0, 1)
+        ref = torch.bmm(dy_blocks.transpose(1, 2), dy_blocks)
+    torch.testing.assert_close(request.grad_gram_buffer, ref, rtol=1e-4, atol=1e-4)
+    assert float(request.grad_count_buffer.item()) == 128.0
+    assert request.grad_rows == 128
 
 
 # ---------------------------------------------------------------------------
@@ -293,8 +379,9 @@ def test_linear_diag_accumulates_at_wgrad_site():
         params_dtype=torch.bfloat16,
         fuse_wgrad_accumulation=True,
     ).cuda()
-    request = _wgrad_buffer_setup(
-        module, recipe=("diag", 0), dim=in_features
+    module.weight.main_grad = torch.zeros_like(module.weight, dtype=torch.float32)
+    request = _attach_request(
+        module.weight, approximation="diag", with_grad=True, dim=in_features, grad_dim=out_features
     )
 
     x = torch.randn(64, in_features, dtype=torch.bfloat16, device="cuda", requires_grad=True)
@@ -304,10 +391,20 @@ def test_linear_diag_accumulates_at_wgrad_site():
     ref = (x.detach().float() ** 2).sum(dim=0)
     torch.testing.assert_close(request.gram_buffer, ref, rtol=5e-2, atol=5e-2)
     assert float(request.count_buffer.item()) == 64.0
+    torch.testing.assert_close(
+        request.grad_gram_buffer,
+        torch.full((out_features,), 64.0, dtype=torch.float32, device="cuda"),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    assert float(request.grad_count_buffer.item()) == 64.0
+    assert request.feature_rows == 64
+    assert request.grad_rows == 64
 
 
 @requires_cuda
-def test_linear_requires_fuse_wgrad_accumulation():
+def test_linear_diag_accumulates_without_fused_main_grad():
+    torch.manual_seed(13)
     in_features, out_features = 32, 32
     module = te.Linear(
         in_features=in_features,
@@ -316,10 +413,27 @@ def test_linear_requires_fuse_wgrad_accumulation():
         params_dtype=torch.bfloat16,
         fuse_wgrad_accumulation=False,
     ).cuda()
-    _wgrad_buffer_setup(module, recipe=("diag", 0), dim=in_features)
+    request = _attach_request(
+        module.weight, approximation="diag", with_grad=True, dim=in_features, grad_dim=out_features
+    )
+
     x = torch.randn(16, in_features, dtype=torch.bfloat16, device="cuda", requires_grad=True)
-    with pytest.raises(NotImplementedError, match="fuse_wgrad_accumulation"):
-        module(x)
+    y = module(x)
+    y.sum().backward()
+
+    ref = (x.detach().float() ** 2).sum(dim=0)
+    torch.testing.assert_close(request.gram_buffer, ref, rtol=5e-2, atol=5e-2)
+    assert float(request.count_buffer.item()) == 16.0
+    torch.testing.assert_close(
+        request.grad_gram_buffer,
+        torch.full((out_features,), 16.0, dtype=torch.float32, device="cuda"),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    assert float(request.grad_count_buffer.item()) == 16.0
+    assert request.feature_rows == 16
+    assert request.grad_rows == 16
+    assert module.weight.grad is not None
 
 
 @requires_cuda
@@ -343,6 +457,7 @@ def test_layernorm_linear_diag_accumulates():
     # a strictly positive accumulation (all diag entries are sums of squares).
     assert torch.all(request.gram_buffer >= 0).item()
     assert request.gram_buffer.sum().item() > 0.0
+    assert request.feature_rows == 32
 
 
 @requires_cuda
@@ -368,6 +483,8 @@ def test_layernorm_mlp_accumulates_both_fc1_and_fc2():
 
     assert fc1_request.gram_buffer.sum().item() > 0.0
     assert fc2_request.gram_buffer.sum().item() > 0.0
+    assert fc1_request.feature_rows == 48
+    assert fc2_request.feature_rows == 48
 
 
 @requires_cuda
